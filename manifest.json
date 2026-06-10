@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Pardeh",
+  "version": "1.2.0",
+  "description": "End-to-end encryption overlay for Bale Web, Rubika, Eitaa, and more.",
+  "minimum_chrome_version": "114",
+  "permissions": ["storage", "activeTab", "scripting", "tabs"],
+  "host_permissions": [
+    "https://web.bale.ai/*",
+    "https://web.rubika.ir/*",
+    "https://web.eitaa.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Pardeh"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://web.bale.ai/*",
+        "https://web.rubika.ir/*",
+        "https://web.eitaa.com/*"
+      ],
+      "js": [
+        "platform.js",
+        "platforms/bale.js",
+        "platforms/rubika.js",
+        "platforms/eitaa.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}

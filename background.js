@@ -141,8 +141,8 @@ async function handleHandshakeClick(chatId, senderTabId) {
 
   await clearExpiredPendingHandshake(chatId);
   const pending = await getPendingHandshake(chatId);
-  const tabId = senderTabId ?? await getActiveBaleTabId();
-  if (!tabId) return { success: false, error: "No Bale tab found" };
+  const tabId = senderTabId ?? await getActiveSupportedTabId();
+  if (!tabId) return { success: false, error: "No supported messenger tab found" };
 
   // Step 1: nothing yet => send HS1
   if (!pending) {
@@ -266,12 +266,19 @@ async function clearExpiredPendingHandshake(chatId) {
   }
 }
 
-async function getActiveBaleTabId() {
-  const baleTabs = await chrome.tabs.query({ url: "*://web.bale.ai/*" });
-  if (baleTabs.length > 0) return baleTabs[0].id ?? null;
+async function getActiveSupportedTabId() {
+  const supportedTabs = await chrome.tabs.query({
+    url: ["*://web.bale.ai/*", "*://web.rubika.ir/*", "*://web.eitaa.com/*"]
+  });
+  if (supportedTabs.length > 0) return supportedTabs[0].id ?? null;
 
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   return tabs[0]?.id ?? null;
+}
+
+// Kept for backward compatibility.
+async function getActiveBaleTabId() {
+  return getActiveSupportedTabId();
 }
 
 async function sendMessageToTab(tabId, message, retries = 2) {
@@ -296,9 +303,17 @@ async function ensureContentScript(tabId) {
     return;
   } catch (_) {}
 
+  // Reinject the full stack (platform registry + all adapters + core).
+  // Injecting only content.js leaves window.__E2E_PLATFORM undefined.
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ["content.js"]
+    files: [
+      "platform.js",
+      "platforms/bale.js",
+      "platforms/rubika.js",
+      "platforms/eitaa.js",
+      "content.js"
+    ]
   });
 
   await sleep(250);

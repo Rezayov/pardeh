@@ -24,6 +24,7 @@
     messageInput: null,
     bypassNextSend: false,
     urlWatchInterval: null,
+    chatIdPollInterval: null,
     attachRetryTimer: null,
     initTimer: null,
     processedCache: new Set(),
@@ -36,12 +37,31 @@
     routeHooksInstalled: false,
     lastKnownUrl: location.href,
     platformRetryCount: 0,
-    maxPlatformRetries: 10
+    maxPlatformRetries: 10,
+    pendingChatId: undefined,
+    pendingChatCount: 0,
+    chatIdHistory: []
   };
 
   window[INSTANCE_KEY] = { cleanup };
+  // Debug hook for DevTools: __E2E_DEBUG.getState() / getHistory().
+  try {
+    window.__E2E_DEBUG = {
+      getState: () => ({
+        chatId: state.chatId,
+        encryptionEnabled: state.encryptionEnabled,
+        hasSharedKey: !!state.sharedKey,
+        platform: state.platform?.name || null,
+        inputFound: !!findMessageInput(),
+        sendButtonFound: !!findSendButton(),
+        containerFound: !!findMessageContainer()
+      }),
+      getHistory: () => state.chatIdHistory.slice(-15)
+    };
+  } catch (_) {}
 
   console.log("[E2E] ===================== CONTENT SCRIPT STARTED =====================");
+  console.log("[E2E] build 2026-10-17e (enter-only-submit, debounce, sweep-heal)");
 
   bootstrap();
 
@@ -96,6 +116,7 @@
     await reloadChatState();
 
     installRouteChangeHooks();
+    startChatIdPoller();
     startDomWatcher();
     attachUiHooks(true);
     observeMessages(true);
@@ -111,6 +132,7 @@
 
     try {
       if (state.urlWatchInterval) clearInterval(state.urlWatchInterval);
+      if (state.chatIdPollInterval) clearInterval(state.chatIdPollInterval);
       if (state.attachRetryTimer) clearTimeout(state.attachRetryTimer);
       if (state.initTimer) clearTimeout(state.initTimer);
       if (state.messageObserver) state.messageObserver.disconnect();
@@ -212,9 +234,7 @@
     const notifyRouteChange = async () => {
       if (state.destroyed) return;
       const newChatId = await extractChatId();
-      if (newChatId && newChatId !== state.chatId) {
-        await handleChatChanged(newChatId);
-      }
+      await requestChatChanged(newChatId || null);
     };
 
     const originalPushState = history.pushState;
@@ -243,11 +263,19 @@
   }
 
   async function handleChatChanged(newChatId) {
-    if (!newChatId || state.destroyed || newChatId === state.chatId) return;
+    if (state.destroyed || newChatId === state.chatId) return;
     console.log("[E2E] Chat changed:", state.chatId, "=>", newChatId);
-    state.chatId = newChatId;
+    try {
+      state.chatIdHistory.push({ from: state.chatId, to: newChatId || null, at: new Date().toISOString() });
+      if (state.chatIdHistory.length > 30) state.chatIdHistory.shift();
+    } catch (_) {}
+    state.pendingChatId = undefined;
+    state.pendingChatCount = 0;
+    state.chatId = newChatId || null;
     state.processedCache.clear();
-    await safeSendToBackground("CHAT_ID_CHANGED", { chatId: newChatId });
+    if (newChatId) {
+      await safeSendToBackground("CHAT_ID_CHANGED", { chatId: newChatId });
+    }
     await reloadChatState();
     if (state.messageObserver) {
       state.messageObserver.disconnect();
@@ -365,6 +393,15 @@
     if (!container) return;
     state.messageObserver = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
+        // Angular sometimes swaps bubble text in place (same node, new
+        // characterData) instead of adding nodes — childList alone misses it.
+        if (mutation.type === "characterData") {
+          const t = mutation.target?.nodeValue || "";
+          if (!t.includes("E2EMSG:") && !t.includes("E2EHS")) continue;
+          const item = closestMessageItem(mutation.target?.parentElement);
+          if (item) processNewMessage(item).catch(console.error);
+          continue;
+        }
         for (const node of mutation.addedNodes) {
           if (node.nodeType !== 1) continue;
           const items = getMessageItemsFromNode(node);
@@ -374,7 +411,23 @@
         }
       }
     });
-    state.messageObserver.observe(container, { childList: true, subtree: true });
+    state.messageObserver.observe(container, { childList: true, subtree: true, characterData: true });
+  }
+
+  function closestMessageItem(el) {
+    let cur = el instanceof Element ? el : null;
+    const container = findMessageContainer();
+    let depth = 0;
+    while (cur && cur !== document.documentElement && depth < 10) {
+      try {
+        const items = getMessageItemsFromNode(cur);
+        if (items.includes(cur)) return cur;
+      } catch (_) {}
+      if (cur === container) break;
+      cur = cur.parentElement;
+      depth++;
+    }
+    return null;
   }
 
   async function scanExistingMessages() {
@@ -389,11 +442,29 @@
 
   async function processNewMessage(messageElement) {
     if (state.destroyed) return;
+    if (messageElement instanceof Element && !messageElement.isConnected) return;
     const payload = extractMessagePayload(messageElement);
     if (!payload?.text) return;
+    const textEl = payload.textElement;
+    // Already rendered into this exact node — never touch it again. EXCEPT a
+    // node poisoned by a failed render (flag set, raw envelope still present):
+    // clear the stale flag and heal it now, otherwise it stays raw forever.
+    if (textEl?.dataset?.e2eDecrypted === "1") {
+      const stillRaw = /E2EMSG:|E2EHS1:|E2EHS2:/.test(textEl.textContent || "");
+      if (!stillRaw) return;
+      try {
+        delete textEl.dataset.e2eDecrypted;
+        textEl.removeAttribute("data-e2e-decrypted");
+      } catch (_) {}
+    }
     const originalText = payload.text.trim();
     const cacheKey = buildProcessedKey(originalText);
-    if (cacheKey && state.processedCache.has(cacheKey)) {
+    const isEncrypted = originalText.startsWith("E2EMSG:");
+    // NOTE: the processed cache is only a dedup for handshake notifications.
+    // Encrypted bubbles must NOT be skipped by text: Rubika replaces our
+    // just-decrypted pending bubble with the server-confirmed echo (same
+    // ciphertext, brand-new node). Skipping it leaves E2EMSG: visible.
+    if (cacheKey && state.processedCache.has(cacheKey) && !isEncrypted) {
       console.log("[E2E] processNewMessage: already processed, skipping", originalText.slice(0, 50));
       return;
     }
@@ -444,7 +515,7 @@
         const decrypted = await decryptMessage(ciphertextB64, ivB64);
         if (payload.textElement) {
           console.log("[E2E] Decryption successful, rendering");
-          renderDecryptedMessage(payload.textElement, decrypted);
+          renderDecryptedMessage(payload.textElement, decrypted, originalText);
         }
       } catch (err) {
         console.error("[E2E] Decryption failed:", err);
@@ -461,109 +532,86 @@
     }
   }
 
-  function findBestTextContainer(messageElement) {
-    const textCandidates = ['[rb-copyable]', '[rb-message-text]', '.message [dir="auto"]', '.message'];
-    for (const sel of textCandidates) {
-      const nodes = messageElement.querySelectorAll(sel);
-      for (const node of nodes) {
-        const txt = node.textContent?.trim();
-        if (txt && (txt.includes('E2EMSG:') || txt.includes('E2EHS'))) return node;
-      }
-    }
-    const dirDiv = messageElement.querySelector('div[dir]');
-    if (dirDiv && dirDiv.textContent?.trim()) return dirDiv;
-    return messageElement;
+  // Generic envelope fallback used when a platform module can't locate the
+  // text node (e.g. Rubika's pending-bubble structure differs from confirmed
+  // bubbles). Returns the deepest leaf element containing the envelope so
+  // rendering never wipes bubble chrome (timestamps, tails).
+  function extractAnyEnvelope(text) {
+    if (!text) return null;
+    const hs1b = text.match(/\[\[E2EHS1:([A-Za-z0-9+/=]{80,140})\]\]/);
+    if (hs1b) return `[[E2EHS1:${hs1b[1]}]]`;
+    const hs2b = text.match(/\[\[E2EHS2:([A-Za-z0-9+/=]{80,140})\]\]/);
+    if (hs2b) return `[[E2EHS2:${hs2b[1]}]]`;
+    const hs1 = text.match(/E2EHS1:[A-Za-z0-9+/=]{80,140}/);
+    if (hs1) return hs1[0];
+    const hs2 = text.match(/E2EHS2:[A-Za-z0-9+/=]{80,140}/);
+    if (hs2) return hs2[0];
+    const msg = text.match(/E2EMSG:([A-Za-z0-9+/=]+):([A-Za-z0-9+/=]+)/);
+    return msg ? msg[0] : null;
   }
 
-  async function waitForAndDecryptMessage(encryptedText, timeoutMs = 5000) {
-    console.log("[E2E] waitForAndDecryptMessage: waiting for message with text", encryptedText.slice(0, 50));
+  // Post-send sweep: re-resolve everything FRESH from the live DOM on every
+  // pass. The old implementation held onto element references across sleeps,
+  // but Rubika swaps the pending bubble for the server-confirmed echo —
+  // decrypting a detached node is invisible. Works for E2EMSG and HS texts.
+  async function sweepOutgoingMessage(sentText, timeoutMs = 6000) {
+    console.log("[E2E] sweepOutgoingMessage: watching for", sentText.slice(0, 50));
+    const head = sentText.slice(0, 50);
     const start = Date.now();
-    let foundMsg = null;
-    let foundTextElement = null;
-
+    let healed = false;
+    // The key may have been transiently wiped (chat view re-render between
+    // send and echo). Reload once so decrypt actually has a key to work with.
+    if (!state.sharedKey) {
+      try {
+        await reloadChatState();
+      } catch (_) {}
+    }
     while (Date.now() - start < timeoutMs) {
+      if (state.destroyed) break;
       const container = findMessageContainer();
       if (container) {
-        const allMessages = state.platform?.getAllMessageElements?.(container) || [];
-        console.log("[E2E] waitForAndDecryptMessage: scanning", allMessages.length, "messages");
-        for (let i = allMessages.length - 1; i >= 0; i--) {
-          const msg = allMessages[i];
-          const msgText = msg.textContent?.trim() || "";
-          if (msgText === encryptedText || msgText.includes(encryptedText.slice(0, 50))) {
-            foundMsg = msg;
-            foundTextElement = findBestTextContainer(msg);
-            console.log("[E2E] Found outgoing message!");
-            break;
-          }
+        const items = state.platform?.getAllMessageElements?.(container) || [];
+        for (const msg of items) {
+          if (!(msg instanceof Element) || !msg.isConnected) continue;
+          const txt = msg.textContent || "";
+          if (txt !== sentText && !txt.includes(head)) continue;
+          await processNewMessage(msg).catch(() => {});
+          healed = true;
         }
-        if (foundMsg) break;
-      }
-      await sleep(200);
-    }
-
-    if (!foundMsg) {
-      console.warn("[E2E] Could not find outgoing message to decrypt after timeout");
-      return false;
-    }
-
-    console.log("[E2E] Waiting 1200ms for platform to stabilize...");
-    await sleep(1200);
-
-    const cacheKey = buildProcessedKey(encryptedText);
-    if (cacheKey) {
-      state.processedCache.delete(cacheKey);
-      console.log("[E2E] Cleared cache for this message");
-    }
-
-    if (foundTextElement && state.sharedKey) {
-      try {
-        const rawText = foundTextElement.textContent.trim();
-        if (rawText.startsWith("E2EMSG:")) {
-          const parts = rawText.slice(7).split(":");
-          if (parts.length >= 2) {
-            const ivB64 = parts[0].trim();
-            const ciphertextB64 = parts.slice(1).join(":").trim();
-            if (looksLikeBase64(ivB64) && looksLikeBase64(ciphertextB64)) {
-              const decrypted = await decryptMessage(ciphertextB64, ivB64);
-              console.log("[E2E] Direct decryption successful:", decrypted);
-              renderDecryptedMessage(foundTextElement, decrypted);
-              return true;
-            }
-          }
-        }
-      } catch (err) {
-        console.error("[E2E] Direct decryption failed:", err);
-      }
-    }
-
-    console.log("[E2E] Fallback: calling processNewMessage...");
-    await processNewMessage(foundMsg);
-
-    await sleep(800);
-    const currentText = foundMsg.textContent?.trim() || "";
-    if (currentText === encryptedText || currentText.includes(encryptedText.slice(0, 50))) {
-      console.log("[E2E] Message still encrypted, forcing final decryption");
-      if (foundTextElement && state.sharedKey) {
-        try {
-          const rawText = foundTextElement.textContent.trim();
-          const parts = rawText.slice(7).split(":");
-          const ivB64 = parts[0].trim();
-          const ciphertextB64 = parts.slice(1).join(":").trim();
-          const decrypted = await decryptMessage(ciphertextB64, ivB64);
-          renderDecryptedMessage(foundTextElement, decrypted);
-          console.log("[E2E] Final forced decryption applied");
-        } catch (e) {
-          console.error("[E2E] Final decryption failed:", e);
+        // Done when our envelope no longer appears raw in any connected node.
+        const stillRaw = items.some((msg) => {
+          if (!(msg instanceof Element) || !msg.isConnected) return false;
+          const txt = msg.textContent || "";
+          if (txt !== sentText && !txt.includes(head)) return false;
+          if (msg.querySelector?.('[data-e2e-decrypted="1"]')) return false;
+          return /E2EMSG:|E2EHS1:|E2EHS2:/.test(txt);
+        });
+        if (healed && !stillRaw) {
+          console.log("[E2E] sweepOutgoingMessage: outgoing message healed");
+          return true;
         }
       }
-    } else {
-      console.log("[E2E] Message already decrypted after first attempt");
+      await sleep(400);
     }
-    return true;
+    if (!healed) console.warn("[E2E] sweepOutgoingMessage: sent message never observed");
+    else console.warn("[E2E] sweepOutgoingMessage: timed out with raw echo remaining");
+    return healed;
   }
 
   async function handleEncryptedSend() {
     console.log("[E2E] handleEncryptedSend called");
+    // Re-resolve input: Rubika recreates the composer on chat switch.
+    state.messageInput = findMessageInput() || state.messageInput;
+    // Force-sync chat state to the VISIBLE chat before touching crypto: if a
+    // transient misread drifted state.chatId, the key lookup below would miss
+    // and the message would send unencrypted.
+    try {
+      const liveId = await extractChatId();
+      if (liveId && liveId !== state.chatId) {
+        console.log("[E2E] send-path chatId resync:", state.chatId, "=>", liveId);
+        await handleChatChanged(liveId);
+      }
+    } catch (_) {}
     if (state.destroyed || !state.messageInput || !state.sharedKey) {
       console.log("[E2E] handleEncryptedSend aborted: destroyed=", state.destroyed, "input=", !!state.messageInput, "key=", !!state.sharedKey);
       return;
@@ -575,32 +623,99 @@
       const encrypted = await encryptMessage(originalMessage);
       console.log("[E2E] encrypted:", encrypted.slice(0, 80));
       setInputText(state.messageInput, encrypted);
-      await sleep(100);
+      // Give Angular time to copy the composer DOM into draftMessage.text
+      // before submitting (measured: 600ms is not enough, ~1s+ is safe;
+      // ensureComposerSent below retries if it still wasn't).
+      await sleep(900);
 
-      const input = state.messageInput;
-      const enterEvent = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
-      input.dispatchEvent(enterEvent);
-      input.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-      console.log("[E2E] Dispatched Enter events");
+      submitComposerOnce(state.messageInput);
+      console.log("[E2E] Submitted composer");
 
-      await sleep(50);
-      const sendButton = findSendButton();
-      if (sendButton) {
-        state.bypassNextSend = true;
-        sendButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-        await sleep(50);
-        state.bypassNextSend = false;
-        console.log("[E2E] Clicked send button as fallback");
+      // Single-Enter UX: verify the message actually left and retry
+      // automatically while the composer still holds our exact ciphertext.
+      // Only on platforms that clear the composer on send (Rubika does).
+      if (state.platform?.composerClearedOnSend) {
+        await ensureComposerSent(encrypted);
+      } else {
+        await sleep(120);
       }
 
-      clearInput(state.messageInput);
-      console.log("[E2E] Calling waitForAndDecryptMessage...");
-      await waitForAndDecryptMessage(encrypted);
+      console.log("[E2E] Calling sweepOutgoingMessage...");
+      await sweepOutgoingMessage(encrypted);
       console.log("[E2E] Done with outgoing message handling");
     } catch (err) {
       console.error("[E2E] Encryption failed:", err);
     }
+  }
+
+  function dispatchEnterKey(el) {
+    // new KeyboardEvent({keyCode}) ignores keyCode in Chrome (read-only).
+    // Rubika checks `13 == e.keyCode`, so patch the property explicitly.
+    const make = (type) => {
+      const ev = new KeyboardEvent(type, {
+        bubbles: true, cancelable: true, key: "Enter", code: "Enter", composed: true
+      });
+      try {
+        Object.defineProperty(ev, "keyCode", { value: 13 });
+        Object.defineProperty(ev, "which", { value: 13 });
+      } catch (_) {}
+      return ev;
+    };
+    el.dispatchEvent(make("keydown"));
+    el.dispatchEvent(make("keypress"));
+    el.dispatchEvent(make("keyup"));
+  }
+
+  // Rubika copies the composer DOM into Angular state (draftMessage.text)
+  // asynchronously after our programmatic set — the send button can flip to
+  // `send` mode while the draft is still stale, and both synthetic Enter and
+  // synthetic click then silently no-op. So after submitting, VERIFY the
+  // composer actually cleared and retry automatically (the "second Enter" the
+  // user would otherwise press by hand). Only retries while the composer
+  // still holds exactly our text, so a real send is never duplicated.
+  async function ensureComposerSent(expectedText, maxRetries = 2) {
+    const want = (expectedText || "").trim();
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      await sleep(attempt === 0 ? 900 : 800);
+      if (state.destroyed) return false;
+      let cur = "";
+      try {
+        cur = getInputText(findMessageInput() || state.messageInput).trim();
+      } catch (_) {}
+      if (cur !== want) {
+        console.log("[E2E] ensureComposerSent: composer cleared, message sent");
+        return true;
+      }
+      if (attempt < maxRetries) {
+        console.log("[E2E] ensureComposerSent: composer still holds text, retrying submit", attempt + 1);
+        const input = findMessageInput() || state.messageInput;
+        if (!input) return false;
+        try {
+          input.focus();
+        } catch (_) {}
+        await sleep(150);
+        submitComposerOnce(input);
+      }
+    }
+    let cur = "";
+    try {
+      cur = getInputText(findMessageInput() || state.messageInput).trim();
+    } catch (_) {}
+    return cur !== want;
+  }
+
+  function submitComposerOnce(input) {
+    if (typeof state.platform?.submitComposer === "function") {
+      try {
+        state.platform.submitComposer();
+        return;
+      } catch (e) {
+        console.warn("[E2E] platform submit failed, falling back", e);
+      }
+    }
+    // Enter-only fallback (see platform note): never synthesize clicks, a
+    // click would send whatever stale text the draft still holds.
+    dispatchEnterKey(input);
   }
 
   async function handleSendChatMessageCommand(text) {
@@ -608,19 +723,37 @@
     if (!input) throw new Error("Chat input not found");
     const sendButton = await waitForSendButton(5000);
     if (!sendButton) throw new Error("Send button not found");
+    state.messageInput = input;
+    state.sendButton = sendButton;
     setInputText(input, text);
+    // Let Angular pick up the programmatic change before clicking send.
+    await sleep(900);
+    if (typeof state.platform?.submitComposer === "function") {
+      state.bypassNextSend = true;
+      try {
+        state.platform.submitComposer();
+      } finally {
+        setTimeout(() => { state.bypassNextSend = false; }, 60);
+      }
+    } else {
+      state.bypassNextSend = true;
+      try {
+        // Enter-only: it re-syncs the draft from the DOM before sending.
+        // Never click here — a click would send the stale pre-encryption
+        // draft (e.g. the user's half-typed plaintext) unencrypted.
+        dispatchEnterKey(input);
+      } finally {
+        setTimeout(() => { state.bypassNextSend = false; }, 60);
+      }
+    }
     await sleep(120);
-    state.bypassNextSend = true;
-    sendButton.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-    await sleep(50);
-    state.bypassNextSend = false;
-  }
-
-  function triggerSendMessage() {
-    const sendButton = findSendButton();
-    if (!sendButton) return;
-    state.bypassNextSend = true;
-    sendButton.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+    if (state.platform?.composerClearedOnSend) {
+      await ensureComposerSent(text, 1);
+    }
+    // Don't await: the popup's HANDSHAKE_CLICK already got its answer path via
+    // this command's response; the sweep heals our own HS echo in the background
+    // (same pending-vs-confirmed replacement issue as encrypted messages).
+    sweepOutgoingMessage(text).catch(() => {});
   }
 
   // ---- Platform delegation helpers ----
@@ -631,14 +764,62 @@
 
   function waitForChatId(timeoutMs = 15000) {
     return new Promise((resolve) => {
-      const check = async () => {
-        const id = await extractChatId();
-        if (id) resolve(id);
-        else setTimeout(check, 300);
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(value);
       };
-      const timeout = setTimeout(() => resolve(null), timeoutMs);
-      check().finally(() => clearTimeout(timeout));
+      const check = async () => {
+        if (settled || state.destroyed) return;
+        try {
+          const id = await extractChatId();
+          if (id) {
+            finish(id);
+            return;
+          }
+        } catch (_) {}
+        if (!settled) setTimeout(check, 300);
+      };
+      const timeout = setTimeout(() => finish(null), timeoutMs);
+      check();
     });
+  }
+
+  // Debounced chat switch: Rubika re-renders the chat view (and briefly
+  // detaches topbar/bubbles) on send and on navigation, so a single read can
+  // transiently return null or a different id. Switching storage keys on such
+  // a transient read wipes the shared key mid-send. Require two consecutive
+  // identical reads before committing to the switch.
+  async function requestChatChanged(newChatId) {
+    if (state.destroyed || newChatId === state.chatId) {
+      state.pendingChatId = undefined;
+      state.pendingChatCount = 0;
+      return;
+    }
+    if (newChatId === state.pendingChatId) {
+      state.pendingChatCount++;
+      if (state.pendingChatCount >= 1) {
+        await handleChatChanged(newChatId);
+      }
+      return;
+    }
+    state.pendingChatId = newChatId;
+    state.pendingChatCount = 0;
+  }
+
+  function startChatIdPoller() {
+    // Rubika/Eitaa are SPAs: switching chats often does NOT change location.href,
+    // so history hooks + URL polling miss it. Re-read getChatId() periodically.
+    if (state.chatIdPollInterval) clearInterval(state.chatIdPollInterval);
+    state.chatIdPollInterval = setInterval(async () => {
+      if (state.destroyed) return;
+      try {
+        const id = await extractChatId();
+        await requestChatChanged(id || null);
+      } catch (_) {}
+    }, 2000);
   }
 
   function findMessageContainer() {
@@ -652,7 +833,37 @@
 
   function extractMessagePayload(messageElement) {
     if (!state.platform) return null;
-    return state.platform.extractMessagePayload(messageElement);
+    let payload = null;
+    try {
+      payload = state.platform.extractMessagePayload(messageElement);
+    } catch (_) {
+      payload = null;
+    }
+    if (payload) return payload;
+    // Generic fallback for bubble structures the platform module doesn't know
+    // (e.g. Rubika's pending bubble before server confirmation): scan leaf
+    // nodes deepest-first and extract the envelope per-leaf, where the text
+    // is exact (whole-bubble text can glue ciphertext to the timestamp).
+    try {
+      if (!(messageElement instanceof Element)) return null;
+      const all = [messageElement, ...messageElement.querySelectorAll("*")];
+      for (let i = all.length - 1; i >= 0; i--) {
+        const el = all[i];
+        if (!(el instanceof Element) || el.children.length > 0) continue;
+        const t = el.textContent || "";
+        if (!t.includes("E2EMSG:") && !t.includes("E2EHS")) continue;
+        const env = extractAnyEnvelope(t);
+        if (!env) continue;
+        return {
+          text: env,
+          textElement: el,
+          kind: env.startsWith("E2EMSG:") ? "encrypted" : "handshake"
+        };
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
   }
 
   function findMessageInput() {
@@ -698,6 +909,12 @@
 
   function getInputText(el) {
     if (!el) return "";
+    try {
+      if (typeof state.platform?.getComposerText === "function" && state.messageInput && el === state.messageInput) {
+        const t = state.platform.getComposerText();
+        if (typeof t === "string" && t.trim()) return t;
+      }
+    } catch (_) {}
     if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") return el.value || "";
     if (el.isContentEditable) return el.innerText || el.textContent || "";
     return "";
@@ -705,6 +922,19 @@
 
   function setInputText(el, text) {
     if (!el) return;
+    // Prefer the platform's framework-aware setter (Rubika/Angular needs a
+    // keyup afterwards so draftMessage.text actually updates).
+    try {
+      if (typeof state.platform?.setComposerText === "function") {
+        if (state.platform.setComposerText(text)) {
+          // Extra keyup for jQuery texteditor.onChange -> checkDraft sync.
+          try {
+            el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true }));
+          } catch (_) {}
+          return;
+        }
+      }
+    } catch (_) {}
     el.focus();
     if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
       el.value = text;
@@ -720,10 +950,17 @@
       }
     }
     el.dispatchEvent(new Event("input", { bubbles: true }));
+    try {
+      el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true }));
+    } catch (_) {}
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  function clearInput(el) { setInputText(el, ""); }
+  function clearInput(el) {
+    // NOTE: do NOT clear immediately after submit — Rubika reads
+    // draftMessage.text on click; clearing the DOM first can blank the draft
+    // before sendClicked runs. The app clears the composer itself on send.
+  }
 
   // ---- Encryption utilities ----
   async function encryptMessage(plaintext) {
@@ -793,8 +1030,62 @@
     return "ltr";
   }
 
-  function renderDecryptedMessage(textElement, decryptedText) {
+  function replaceEnvelopeInTextNodes(root, envelope, replacement) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const dir = detectTextDirection(replacement);
+    let node;
+    while ((node = walker.nextNode())) {
+      const idx = (node.nodeValue || "").indexOf(envelope);
+      if (idx === -1) continue;
+      const before = node.nodeValue.slice(0, idx);
+      const after = node.nodeValue.slice(idx + envelope.length);
+      const parent = node.parentNode;
+      if (before) parent.insertBefore(document.createTextNode(before), node);
+      const span = document.createElement("span");
+      span.textContent = replacement;
+      span.dir = dir;
+      span.style.textAlign = dir === "rtl" ? "right" : "left";
+      span.style.direction = dir;
+      parent.insertBefore(span, node);
+      if (after) parent.insertBefore(document.createTextNode(after), node);
+      parent.removeChild(node);
+      return true;
+    }
+    return false;
+  }
+
+  function renderDecryptedMessage(textElement, decryptedText, rawEnvelope) {
     if (!textElement || textElement.dataset.e2eDecrypted === "1") return;
+    // When the target node holds more than just the envelope (bubble chrome,
+    // timestamps, pending-bubble wrappers), replace only the envelope
+    // substring instead of wiping the whole node.
+    const current = textElement.textContent || "";
+    if (rawEnvelope && current.includes(rawEnvelope) && current.trim() !== rawEnvelope.trim()) {
+      let replaced = false;
+      try {
+        replaced = replaceEnvelopeInTextNodes(textElement, rawEnvelope, decryptedText);
+      } catch (err) {
+        console.warn("[E2E] substring replace failed, falling back to full replace", err);
+        replaced = false;
+      }
+      if (replaced) {
+        // Verify the envelope is really gone before flagging: Angular reuses
+        // bubble nodes across re-renders, and a flag on still-raw text would
+        // suppress all future healing for that node.
+        const leftover = (textElement.textContent || "").includes(rawEnvelope);
+        if (!leftover) {
+          textElement.dataset.e2eDecrypted = "1";
+          if (state.platform?.addDecryptionIndicator) {
+            state.platform.addDecryptionIndicator(textElement);
+          } else {
+            addDecryptedMessageIndicator(textElement);
+          }
+          console.log("[E2E] renderDecryptedMessage: substring-replaced envelope", decryptedText);
+          return;
+        }
+        console.warn("[E2E] substring replace unverified, falling back to full replace");
+      }
+    }
     textElement.textContent = "";
     textElement.dataset.e2eDecrypted = "1";
     const textSpan = document.createElement("span");
